@@ -258,6 +258,16 @@ pub struct OutputWriter {
     current_binary_offset: Option<u64>,
     all_bytes_searched: u64,
     all_searches: u64,
+    /// Distinct matching lines and match spans seen so far, counted the same
+    /// way regardless of output format.
+    ///
+    /// JSON mode already tracks this per-file via `file_stats`/`total_stats`
+    /// for its `summary` event; this is a separate, simpler running total so
+    /// the human-readable `--stats` line can report a match count too,
+    /// without touching the JSON accounting.
+    total_matches: u64,
+    total_matched_lines: u64,
+    last_counted_match: Option<(String, usize)>,
 }
 
 impl OutputWriter {
@@ -292,7 +302,19 @@ impl OutputWriter {
             current_binary_offset: None,
             all_bytes_searched: 0,
             all_searches: 0,
+            total_matches: 0,
+            total_matched_lines: 0,
+            last_counted_match: None,
         }
+    }
+
+    /// Total match spans and distinct matching lines counted so far.
+    ///
+    /// Counted once per `write_match` call regardless of output format, so
+    /// this is available to the human-readable `--stats` summary the same
+    /// way `total_stats` feeds the JSON `summary` event.
+    pub fn match_totals(&self) -> (u64, u64) {
+        (self.total_matches, self.total_matched_lines)
     }
 
     pub fn is_json(&self) -> bool {
@@ -542,12 +564,25 @@ impl OutputWriter {
             self.field_prefix(&ctx.file, ctx.line_number, None, ctx.absolute_offset, false);
         writeln!(self.stdout, "{prefix}{content}")?;
         self.last_printed_line = Some((ctx.file.clone(), ctx.line_number));
-        self.maybe_flush()
+        Ok(())
     }
 
     pub fn write_match(&mut self, m: &Match) -> io::Result<()> {
         let (content, spans) = self.trim_adjust(&m.content, &m.spans);
         let content = content.to_string();
+        // Format-agnostic totals for the human-readable `--stats` summary.
+        // Mirrors the JSON arm's own counting below: a line is counted once
+        // even if it produced multiple spans, and an inverted match (no
+        // spans) still counts as a matched line with zero matches.
+        let already_counted = self
+            .last_counted_match
+            .as_ref()
+            .is_some_and(|(f, l)| f == &m.file && *l == m.line_number);
+        if !already_counted {
+            self.total_matched_lines += 1;
+            self.last_counted_match = Some((m.file.clone(), m.line_number));
+        }
+        self.total_matches += spans.len() as u64;
         match self.config.format {
             OutputFormat::Heading | OutputFormat::Flat => {
                 if !self.config.no_filename {
@@ -770,5 +805,52 @@ fn native_separators(path: &str) -> String {
         path.to_string()
     } else {
         path.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- OutputWriter::match_totals (human-readable `--stats`) ------------
+    //
+    // Mirrors the JSON `file_stats` counting in `write_match`'s Json arm, but
+    // tracked independently so `search_local_index` and `brute_force_search`
+    // can report a match count under plain `--stats` too — previously only
+    // the server-delegated path did.
+
+    fn make_match(file: &str, line: usize, spans: usize) -> Match {
+        Match {
+            file: file.to_string(),
+            line_number: line,
+            content: "line content".to_string(),
+            columns: (0..spans).collect(),
+            spans: (0..spans).map(|i| (i, i + 1)).collect(),
+            absolute_offset: 0,
+            terminator_len: 0,
+        }
+    }
+
+    #[test]
+    fn match_totals_counts_spans_and_dedupes_lines() {
+        let mut w = OutputWriter::new(OutputConfig {
+            format: OutputFormat::Flat,
+            color: ColorMode::Never,
+            ..Default::default()
+        });
+        w.write_match(&make_match("a.rs", 1, 3)).unwrap();
+        w.write_match(&make_match("a.rs", 1, 1)).unwrap(); // same line again
+        w.write_match(&make_match("b.rs", 1, 1)).unwrap(); // same line#, different file
+        assert_eq!(w.match_totals(), (5, 2)); // 3+1+1 matches, 2 distinct lines
+    }
+
+    #[test]
+    fn match_totals_is_zero_before_any_match() {
+        let w = OutputWriter::new(OutputConfig {
+            format: OutputFormat::Flat,
+            color: ColorMode::Never,
+            ..Default::default()
+        });
+        assert_eq!(w.match_totals(), (0, 0));
     }
 }
